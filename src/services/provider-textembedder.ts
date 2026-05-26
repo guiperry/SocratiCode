@@ -36,7 +36,7 @@ import { logger } from "./logger.js";
 // ── Constants ───────────────────────────────────────────────────────────
 
 const FIXED_POINT_SCALE = 10000;
-const TEXTEMBEDDER_BATCH_SIZE = 64;
+const TEXTEMBEDDER_BATCH_SIZE = 128; // server parallelizes internally (default GOMAXPROCS workers)
 const BINARY_START_TIMEOUT_MS = 10_000;
 const HEALTH_POLL_MS = 200;
 
@@ -434,7 +434,6 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
     }
 
     const data: BatchResponse = await response.json() as BatchResponse;
-    const sorted = data.results.sort((a, b) => a.index - b.index);
-    return sorted.map((r) => unscaleVector(r.embedding));
+    return data.results.map((r) => unscaleVector(r.embedding));
   }
 }
