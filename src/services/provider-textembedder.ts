@@ -16,6 +16,11 @@
  *   2. External mode: user runs the binary themselves and sets TEXTEMBEDDER_URL
  *      pointing at the HTTP API (e.g. http://localhost:8089).
  *
+ * Embed requests are serialised through a FIFO queue with health monitoring
+ * and timeout recovery to prevent blockage. Before spawning the binary the
+ * provider probes the target port — if an instance is already running it
+ * uses that one instead.
+ *
  * Optional env:
  *   TEXTEMBEDDER_URL=http://localhost:8089     (external mode — skip binary)
  *   TEXTEMBEDDER_BIN_PATH=<path-to-binary>     (uncompressed binary path)
@@ -39,6 +44,21 @@ const FIXED_POINT_SCALE = 10000;
 const TEXTEMBEDDER_BATCH_SIZE = 128; // server parallelizes internally (default GOMAXPROCS workers)
 const BINARY_START_TIMEOUT_MS = 10_000;
 const HEALTH_POLL_MS = 200;
+
+/** How often to log queue depth / health (ms). */
+const QUEUE_MONITOR_INTERVAL_MS = 5_000;
+
+/** Warn at this many queued embed requests. */
+const QUEUE_WARN_DEPTH = 10;
+
+/** Critical warning at this depth. */
+const QUEUE_CRITICAL_DEPTH = 30;
+
+/** Per-embed-request timeout (ms) — includes all internal batches. */
+const EMBED_TIMEOUT_MS = 120_000;
+
+/** After N consecutive timeouts kill the binary and let the queue re-spawn. */
+const MAX_CONSECUTIVE_TIMEOUTS = 3;
 
 /** Temp dir where the decompressed binary lives. */
 const TMP_DIR = path.join(os.tmpdir(), "socraticode-textembedder");
@@ -149,8 +169,31 @@ let subprocess: ChildProcess | null = null;
 let subprocessUrl: string | null = null;
 let binaryStarting = false;
 
+/** Try to reach an already-running instance on the port before spawning. */
+async function probePort(port: number): Promise<string | null> {
+  const url = `http://localhost:${port}`;
+  try {
+    const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(2000) });
+    if (resp.ok) {
+      logger.info("text-embedder instance already running on port", { port, url });
+      subprocessUrl = url;
+      return url;
+    }
+  } catch {
+    // Nothing listening — will spawn
+  }
+  return null;
+}
+
 async function startBinary(port: number): Promise<string> {
+  // Fast path: already know the URL
   if (subprocessUrl) return subprocessUrl;
+
+  // Probe the port first — another process may already be running
+  const existing = await probePort(port);
+  if (existing) return existing;
+
+  // Another caller is already starting the binary
   if (binaryStarting) {
     return new Promise((resolve, reject) => {
       const interval = setInterval(() => {
@@ -178,6 +221,13 @@ async function startBinary(port: number): Promise<string> {
       (pfx ? `${pfx} (expected name), ` : "") +
       "or set TEXTEMBEDDER_BIN_PATH / TEXTEMBEDDER_URL.",
     );
+  }
+
+  // Re-check port after resolving source — instance may have started while we looked
+  const recheck = await probePort(port);
+  if (recheck) {
+    binaryStarting = false;
+    return recheck;
   }
 
   // Decompress if necessary, or use bare binary directly
@@ -270,6 +320,153 @@ function registerCleanup(): void {
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 }
 
+// ── Embed request queue ──────────────────────────────────────────────
+
+interface EmbedRequest {
+  texts: string[];
+  resolve: (vectors: number[][]) => void;
+  reject: (error: Error) => void;
+  submittedAt: number;
+  batchCount: number;
+}
+
+const embedQueue: EmbedRequest[] = [];
+let queueWorkerRunning = false;
+let queueMonitorTimer: ReturnType<typeof setInterval> | null = null;
+let consecutiveTimeouts = 0;
+
+function startQueueMonitor(): void {
+  if (queueMonitorTimer) return;
+  queueMonitorTimer = setInterval(() => {
+    const depth = embedQueue.length;
+    if (depth === 0) {
+      consecutiveTimeouts = 0; // healthy — reset counter
+      return;
+    }
+
+    const oldest = embedQueue[0];
+    const elapsed = Date.now() - oldest.submittedAt;
+
+    logger.debug("text-embedder embed queue status", {
+      depth,
+      oldestWaitingMs: elapsed,
+      batchCount: oldest.batchCount,
+    });
+
+    if (depth >= QUEUE_CRITICAL_DEPTH) {
+      logger.warn("text-embedder embed queue critically deep", {
+        depth,
+        oldestWaitingMs: elapsed,
+      });
+    } else if (depth >= QUEUE_WARN_DEPTH) {
+      logger.warn("text-embedder embed queue growing", {
+        depth,
+        oldestWaitingMs: elapsed,
+      });
+    }
+  }, QUEUE_MONITOR_INTERVAL_MS);
+}
+
+function stopQueueMonitor(): void {
+  if (queueMonitorTimer) {
+    clearInterval(queueMonitorTimer);
+    queueMonitorTimer = null;
+  }
+}
+
+/**
+ * Process the embed queue — one request at a time. Each request may span
+ * multiple internal HTTP batches (of TEXTEMBEDDER_BATCH_SIZE).
+ */
+async function processQueue(): Promise<void> {
+  if (queueWorkerRunning) return;
+  queueWorkerRunning = true;
+
+  while (embedQueue.length > 0) {
+    const req = embedQueue.shift()!;
+    try {
+      const startTime = Date.now();
+      const results = await doEmbed(req.texts);
+      const duration = Date.now() - startTime;
+
+      if (duration > 10_000) {
+        logger.debug("text-embedder slow embed request", {
+          durationMs: duration,
+          textCount: req.texts.length,
+          batchCount: req.batchCount,
+        });
+      }
+
+      consecutiveTimeouts = 0;
+      req.resolve(results);
+    } catch (err) {
+      const isTimeout = err instanceof Error && (
+        err.name === "TimeoutError" || err.message.includes("aborted")
+      );
+
+      if (isTimeout) {
+        consecutiveTimeouts++;
+        logger.error("text-embedder request timed out", {
+          consecutiveTimeouts,
+          maxConsecutive: MAX_CONSECUTIVE_TIMEOUTS,
+        });
+
+        if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+          logger.error(
+            "text-embedder consecutive timeouts — killing binary for recovery",
+          );
+          killBinary(); // next resolveBaseUrl will re-spawn
+          consecutiveTimeouts = 0;
+        }
+      }
+
+      const msg = err instanceof Error ? err.message : String(err);
+      req.reject(new Error(`text-embedder embed failed: ${msg}`));
+    }
+  }
+
+  queueWorkerRunning = false;
+}
+
+/**
+ * Internal: send a full set of texts through the binary in batches.
+ * Used by the queue worker — not for direct external use.
+ */
+async function doEmbed(texts: string[]): Promise<number[][]> {
+  const baseUrl = await resolveBaseUrl();
+  const results: number[][] = [];
+
+  for (let i = 0; i < texts.length; i += TEXTEMBEDDER_BATCH_SIZE) {
+    const batch = texts.slice(i, i + TEXTEMBEDDER_BATCH_SIZE);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(`${baseUrl}/embed/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ texts: batch }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new Error(
+          `text-embedder /embed/batch failed (${response.status}): ${body}`,
+        );
+      }
+
+      const data: BatchResponse = await response.json() as BatchResponse;
+      results.push(...data.results.map((r) => unscaleVector(r.embedding)));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  return results;
+}
+
 // ── HTTP client ─────────────────────────────────────────────────────────
 
 interface EmbedResponse {
@@ -344,20 +541,34 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
     return { modelPulled: false, containerStarted: false, imagePulled: false };
   }
 
+  /**
+   * Embed an array of texts. Requests are serialised through a FIFO queue
+   * with health monitoring and timeout recovery. The queue worker processes
+   * one request at a time (each split into internal HTTP batches of
+   * TEXTEMBEDDER_BATCH_SIZE).
+   */
   async embed(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) return [];
 
-    const baseUrl = await resolveBaseUrl();
-    const results: number[][] = [];
+    startQueueMonitor();
 
-    for (let i = 0; i < texts.length; i += TEXTEMBEDDER_BATCH_SIZE) {
-      const batch = texts.slice(i, i + TEXTEMBEDDER_BATCH_SIZE);
-      const batchResults = await this._embedBatch(baseUrl, batch);
-      results.push(...batchResults);
-    }
-    return results;
+    return new Promise<number[][]>((resolve, reject) => {
+      embedQueue.push({
+        texts,
+        resolve,
+        reject,
+        submittedAt: Date.now(),
+        batchCount: Math.ceil(texts.length / TEXTEMBEDDER_BATCH_SIZE),
+      });
+
+      // Kick off the worker (no-op if already running)
+      processQueue();
+    });
   }
 
+  /**
+   * Embed a single text directly (no queue). Lightweight — one /embed call.
+   */
   async embedSingle(text: string): Promise<number[]> {
     const baseUrl = await resolveBaseUrl();
 
@@ -410,6 +621,17 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
       }
       const health: HealthResponse = await resp.json() as HealthResponse;
       lines.push(`${icon(true)} text-embedder: Reachable at ${baseUrl}`);
+
+      // Add queue info
+      const queueDepth = embedQueue.length;
+      if (queueDepth > 0) {
+        const oldest = embedQueue[0];
+        const elapsed = Date.now() - oldest.submittedAt;
+        lines.push(`${icon(true)} Embed queue: ${queueDepth} pending (oldest ${elapsed}ms)`);
+      } else {
+        lines.push(`${icon(true)} Embed queue: idle`);
+      }
+
       lines.push(`${icon(true)} Model: ${health.model} (${health.dims} dims)`);
       return { available: true, modelReady: true, statusLines: lines };
     } catch (err) {
@@ -417,23 +639,5 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
       lines.push(`${icon(false)} text-embedder: Not reachable (${message})`);
       return { available: false, modelReady: false, statusLines: lines };
     }
-  }
-
-  private async _embedBatch(baseUrl: string, texts: string[]): Promise<number[][]> {
-    const response = await fetch(`${baseUrl}/embed/batch`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ texts }),
-    });
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      throw new Error(
-        `text-embedder /embed/batch failed (${response.status}): ${body}`,
-      );
-    }
-
-    const data: BatchResponse = await response.json() as BatchResponse;
-    return data.results.map((r) => unscaleVector(r.embedding));
   }
 }
