@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
+import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
+import { collectionName, projectIdFromPath } from "../config.js";
 import { awaitGraphBuild, isGraphBuildInProgress } from "../services/code-graph.js";
 import type { InfraProgressCallback } from "../services/docker.js";
 import { ensureQdrantReady, isDockerAvailable } from "../services/docker.js";
@@ -10,6 +12,7 @@ import { getEmbeddingProvider } from "../services/embedding-provider.js";
 import { getIndexingProgress, indexProject, isIndexingInProgress, removeProjectIndex, requestCancellation, setIndexingProgress, updateProjectIndex } from "../services/indexer.js";
 import { isProjectLocked, terminateLockHolder } from "../services/lock.js";
 import { logger } from "../services/logger.js";
+import { getCollectionInfo } from "../services/qdrant.js";
 import { getWatchedProjects, isWatching, startWatching, stopWatching } from "../services/watcher.js";
 
 const DOCKER_NOT_AVAILABLE_MESSAGE = [
@@ -157,6 +160,64 @@ export async function handleIndexTool(
         "Call codebase_status to check progress. Keep calling it periodically until progress reaches 100%.",
         "Once complete, you can use codebase_search to query the indexed codebase.",
       ];
+      return lines.join("\n");
+    }
+
+    case "codebase_index_and_watch": {
+      const resolved = path.resolve(projectPath);
+      if (isIndexingInProgress(resolved)) {
+        return formatIndexingInProgressMessage(resolved, "codebase_index_and_watch");
+      }
+
+      if (QDRANT_MODE === "managed" && !(await isDockerAvailable())) {
+        return DOCKER_NOT_AVAILABLE_MESSAGE;
+      }
+
+      setIndexingProgress(resolved, {
+        type: "full-index",
+        startedAt: Date.now(),
+        filesTotal: 0,
+        filesProcessed: 0,
+        phase: "preparing infrastructure",
+      });
+
+      const infraProgress: InfraProgressCallback = (msg) => {
+        setIndexingProgress(resolved, {
+          type: "full-index",
+          startedAt: Date.now(),
+          filesTotal: 0,
+          filesProcessed: 0,
+          phase: msg,
+        });
+      };
+      let infraMessages: string[];
+      try {
+        infraMessages = await ensureInfrastructure(infraProgress);
+      } catch (error) {
+        setIndexingProgress(resolved, null);
+        const msg = error instanceof Error ? error.message : String(error);
+        return `Infrastructure setup failed:\n\n${msg}\n\nRun codebase_health for a full diagnostic.`;
+      }
+
+      setIndexingProgress(resolved, null);
+      const extraExts = mergeExtraExtensions(args.extraExtensions as string | undefined);
+
+      const result = await indexProject(resolved, onProgress, extraExts.size > 0 ? extraExts : undefined);
+
+      const lines = [
+        ...infraMessages,
+        `Indexed ${result.filesIndexed} files, ${result.chunksCreated} chunks`,
+        result.cancelled ? "Indexing was cancelled." : "Indexing complete.",
+      ];
+
+      if (!result.cancelled && !isWatching(resolved)) {
+        const started = await startWatching(resolved);
+        if (started) {
+          lines.push("File watcher started.");
+          logger.info("Auto-started file watcher after index_and_watch", { projectPath: resolved });
+        }
+      }
+
       return lines.join("\n");
     }
 
@@ -392,6 +453,107 @@ export async function handleIndexTool(
         statusItems.push(`  - ${resolved} (watched by another process)`);
       }
       return `Currently watching:\n${statusItems.join("\n")}`;
+    }
+
+    case "codebase_index_remaining": {
+      const basePath = path.resolve((args.basePath as string) || process.cwd());
+      const autoIndex = args.autoIndex === true;
+
+      const ignored = new Set(args.ignore
+        ? (args.ignore as string).split(",").map((s: string) => s.trim())
+        : ["KNIRV", "n8n-master", "node_modules"]);
+
+      const projects = readdirSync(basePath)
+        .filter((n) => {
+          if (n.startsWith(".")) return false;
+          if (ignored.has(n)) return false;
+          const f = path.join(basePath, n);
+          try { return statSync(f).isDirectory(); } catch { return false; }
+        })
+        .sort();
+
+      const indexed: string[] = [];
+      const remaining: string[] = [];
+
+      for (const project of projects) {
+        const projectPath = path.join(basePath, project);
+        const pid = projectIdFromPath(projectPath);
+        const coll = collectionName(pid);
+        const info = await getCollectionInfo(coll);
+        if (info && info.pointsCount > 0) {
+          indexed.push(project);
+        } else {
+          remaining.push(project);
+        }
+      }
+
+      const lines: string[] = [];
+      lines.push(`Scanned ${basePath}`);
+      lines.push(`Total: ${projects.length}, Indexed: ${indexed.length}, Remaining: ${remaining.length}`);
+      lines.push("");
+
+      if (indexed.length > 0) {
+        lines.push("── Indexed ──");
+        for (const p of indexed) {
+          const pid = projectIdFromPath(path.join(basePath, p));
+          const coll = collectionName(pid);
+          lines.push(`  ✓ ${p}  (${coll})`);
+        }
+        lines.push("");
+      }
+
+      if (remaining.length > 0) {
+        lines.push("── Not Indexed ──");
+        for (const p of remaining) {
+          const pid = projectIdFromPath(path.join(basePath, p));
+          const coll = collectionName(pid);
+          lines.push(`  · ${p}  (${coll})`);
+        }
+        lines.push("");
+      }
+
+      if (!autoIndex || remaining.length === 0) {
+        if (remaining.length > 0 && !autoIndex) {
+          lines.push(`Run with autoIndex=true to index all ${remaining.length} remaining project(s).`);
+        }
+        return lines.join("\n");
+      }
+
+      // Auto-index remaining projects
+      lines.push(`Indexing ${remaining.length} remaining project(s)...`);
+      lines.push("");
+
+      let success = 0, failed = 0;
+      const failedProjects: string[] = [];
+
+      for (const project of remaining) {
+        const projectPath = path.join(basePath, project);
+        const onProgress = (msg: string) => {
+          const ts = new Date().toISOString().slice(11, 19);
+          logger.info(`[${ts}] ${project}: ${msg}`, { tool: "codebase_index_remaining" });
+        };
+
+        try {
+          lines.push(`\n── ${project} ──`);
+          const result = await indexProject(projectPath, onProgress);
+          lines.push(`  ✓ ${result.filesIndexed} files, ${result.chunksCreated} chunks`);
+          success++;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          lines.push(`  ✗ ${msg}`);
+          failed++;
+          failedProjects.push(project);
+        }
+      }
+
+      lines.push("");
+      lines.push(`── Summary ──`);
+      lines.push(`Indexed: ${success}, Failed: ${failed}`);
+      if (failedProjects.length) {
+        lines.push(`Failed projects: ${failedProjects.join(", ")}`);
+      }
+
+      return lines.join("\n");
     }
 
     default:

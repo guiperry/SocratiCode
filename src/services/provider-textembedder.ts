@@ -137,7 +137,7 @@ let extractedBinPath: string | null = null;
  * the gzipped package asset if needed. Returns the path to the binary.
  */
 async function ensureBinaryExtracted(sourcePath: string): Promise<string> {
-  // Fast path: already decompressed and file still exists
+  // Fast path: already decompressed and file still exists (and is executable)
   if (extractedBinPath) {
     try {
       await fsp.access(extractedBinPath, constants.X_OK);
@@ -145,6 +145,18 @@ async function ensureBinaryExtracted(sourcePath: string): Promise<string> {
     } catch {
       extractedBinPath = null;
     }
+  }
+
+  // Before overwriting, check if the temp binary already exists and is executable.
+  // If it does, use it as-is to avoid ETXTBSY (text file busy) when the binary is
+  // currently running as a subprocess.
+  try {
+    await fsp.access(TMP_BIN_PATH, constants.X_OK);
+    logger.info("Using existing decompressed binary (avoiding overwrite)", { path: TMP_BIN_PATH });
+    extractedBinPath = TMP_BIN_PATH;
+    return extractedBinPath;
+  } catch {
+    // Not present — proceed with decompression
   }
 
   logger.info("Decompressing text-embedder binary", { source: sourcePath });

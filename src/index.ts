@@ -83,6 +83,24 @@ server.tool(
 );
 
 server.tool(
+  "codebase_index_and_watch",
+  "Start indexing a codebase and automatically start file watching once complete. Blocks until indexing finishes (may take many minutes). Calls codebase_watch after completion so future changes are tracked automatically. Prefer this over codebase_index when you want to index once and forget about it.",
+  {
+    projectPath: z
+      .string()
+      .describe("Absolute path to the project directory. If omitted, uses the current working directory.")
+      .optional(),
+    extraExtensions: z
+      .string()
+      .describe("Comma-separated list of additional file extensions to index beyond the built-in set (e.g. '.tpl,.blade,.hbs'). Useful for projects with non-standard file extensions. Can also be set globally via EXTRA_EXTENSIONS env var.")
+      .optional(),
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await handleIndexTool("codebase_index_and_watch", args) }],
+  }),
+);
+
+server.tool(
   "codebase_update",
   "Incrementally update an existing codebase index. Only re-indexes changed files. Runs synchronously. Usually not needed if file watcher is active.",
   {
@@ -137,6 +155,28 @@ server.tool(
   },
   async (args) => ({
     content: [{ type: "text", text: await handleIndexTool("codebase_watch", args) }],
+  }),
+);
+
+server.tool(
+  "codebase_index_remaining",
+  "Scan a directory for projects not yet indexed and optionally index them all. Reports which projects are indexed vs remaining. Use autoIndex=true to batch-index all remaining projects sequentially.",
+  {
+    basePath: z
+      .string()
+      .describe("Absolute path to scan for project directories. Defaults to current working directory.")
+      .optional(),
+    autoIndex: z
+      .boolean()
+      .describe("When true, automatically index all remaining (non-indexed) projects sequentially.")
+      .optional(),
+    ignore: z
+      .string()
+      .describe("Comma-separated list of directory names to skip (e.g. 'KNIRV,n8n-master'). Default: 'KNIRV,n8n-master,node_modules'.")
+      .optional(),
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await handleIndexTool("codebase_index_remaining", args) }],
   }),
 );
 

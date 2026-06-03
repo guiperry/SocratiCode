@@ -565,7 +565,8 @@ export async function getCollectionInfo(name: string): Promise<{
     if (status === 404 || message.includes("Not found") || message.includes("doesn't exist") || message.includes("not found")) {
       return null;
     }
-    logger.warn("getCollectionInfo failed with unexpected error (propagating)", { collection: name, error: message, status });
+    const errorStack = err instanceof Error ? err.stack : undefined;
+    logger.warn("getCollectionInfo failed with unexpected error (propagating)", { collection: name, error: message, status, stack: errorStack });
     throw wrapQdrantError("getCollectionInfo", { collection: name }, err);
   }
 }
