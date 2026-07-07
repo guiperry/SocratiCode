@@ -29,9 +29,12 @@ if (Number.isFinite(nodeMajor) && nodeMajor >= 26) {
   process.exit(1);
 }
 
+import { randomUUID } from "node:crypto";
 import { writeSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { SOCRATICODE_VERSION } from "./constants.js";
 import { logger, setMcpLogSender } from "./services/logger.js";
@@ -41,6 +44,23 @@ import { handleGraphTool } from "./tools/graph-tools.js";
 import { handleIndexTool } from "./tools/index-tools.js";
 import { handleManageTool } from "./tools/manage-tools.js";
 import { handleQueryTool } from "./tools/query-tools.js";
+
+// ── Transport mode ───────────────────────────────────────────────────────
+// When SOCRATICODE_PORT is set, SocratiCode starts an HTTP server that
+// serves multiple MCP clients via the Streamable HTTP transport (each client
+// gets its own session). When unset (default), the classic stdio transport
+// is used for single-client operation.
+const SOCRATICODE_PORT = (() => {
+  const raw = process.env.SOCRATICODE_PORT;
+  if (!raw) return null;
+  const port = parseInt(raw, 10);
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `Invalid SOCRATICODE_PORT: "${raw}". Must be a number between 1 and 65535.`,
+    );
+  }
+  return port;
+})();
 
 const server = new McpServer(
   {
@@ -54,17 +74,11 @@ const server = new McpServer(
   },
 );
 
-// Forward every logger call as an MCP notifications/message so hosts like Cline
-// display log lines in their UI (Cline's stderr path drops the content in non-DEV mode).
-setMcpLogSender((params) => {
-  server.server.sendLoggingMessage(params).catch(() => {
-    // Ignore — transport may not be connected yet during startup.
-  });
-});
-
 // ── Index tools ──────────────────────────────────────────────────────────
 
-server.tool(
+// Tool registration extracted so HTTP mode can create per-session servers.
+function registerAllTools(srv: McpServer): void {
+srv.tool(
   "codebase_index",
   "Start indexing a codebase in the background. Returns immediately. Call codebase_status to poll progress until 100%. Do NOT search until indexing is complete. If already indexing, returns current progress.",
   {
@@ -82,7 +96,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_index_and_watch",
   "Start indexing a codebase and automatically start file watching once complete. Blocks until indexing finishes (may take many minutes). Calls codebase_watch after completion so future changes are tracked automatically. Prefer this over codebase_index when you want to index once and forget about it.",
   {
@@ -100,7 +114,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_update",
   "Incrementally update an existing codebase index. Only re-indexes changed files. Runs synchronously. Usually not needed if file watcher is active.",
   {
@@ -118,7 +132,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_remove",
   "Remove a project's codebase index entirely from the vector database. Safely stops the file watcher, cancels any in-progress indexing/update (with drain), and waits for any in-flight graph build before deleting.",
   {
@@ -129,7 +143,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_stop",
   "Gracefully stop an in-progress indexing operation. The current batch will finish and checkpoint, preserving all progress. Re-run codebase_index to resume from where it left off.",
   {
@@ -143,7 +157,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_watch",
   "Start/stop watching a project directory for file changes and automatically update the index. When starting, first runs an incremental update to catch any changes made since the last session, then keeps the index up to date via debounced file system watching.",
   {
@@ -158,7 +172,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_index_remaining",
   "Scan a directory for projects not yet indexed and optionally index them all. Reports which projects are indexed vs remaining. Use autoIndex=true to batch-index all remaining projects sequentially.",
   {
@@ -182,7 +196,7 @@ server.tool(
 
 // ── Query tools ──────────────────────────────────────────────────────────
 
-server.tool(
+srv.tool(
   "codebase_search",
   "Semantic search across an indexed codebase. Only use after codebase_index is complete (check codebase_status first). Returns relevant code chunks matching a natural language query.",
   {
@@ -221,7 +235,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_status",
   "Check index status: chunk count, indexing progress (%), last completed operation, file watcher state. Call after codebase_index to poll until 100% complete.",
   {
@@ -237,7 +251,7 @@ server.tool(
 
 // ── Graph tools ──────────────────────────────────────────────────────────
 
-server.tool(
+srv.tool(
   "codebase_graph_build",
   "Build a dependency graph of the codebase using static analysis (ast-grep). Maps import/require/export relationships between files. Runs in the background — call codebase_graph_status to poll progress until complete.",
   {
@@ -255,7 +269,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_graph_query",
   "Query the code dependency graph for a specific file. Returns what the file imports and what files depend on it.",
   {
@@ -270,7 +284,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_graph_stats",
   "Get statistics about the code dependency graph: total files, edges, most connected files, orphan files, circular dependencies.",
   {
@@ -284,7 +298,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_graph_circular",
   "Find circular dependencies in the codebase.",
   {
@@ -298,7 +312,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_graph_visualize",
   [
     "Visualise the code dependency graph. Two modes:",
@@ -324,7 +338,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_graph_remove",
   "Remove a project's persisted code graph. Waits for any in-flight graph build to finish first. The graph can be rebuilt with codebase_graph_build or will be rebuilt automatically on the next codebase_index.",
   {
@@ -335,7 +349,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_graph_status",
   "Check the status of the code dependency graph: build progress (if building), node/edge count, when it was last built, whether it's cached in memory. Use this to poll progress after calling codebase_graph_build.",
   {
@@ -351,7 +365,7 @@ server.tool(
 
 // ── Impact analysis (symbol-level call graph) ───────────────────────────
 
-server.tool(
+srv.tool(
   "codebase_impact",
   "Impact Analysis — return the BLAST RADIUS for a file or symbol. Lists every file (and, where helpful, function) that could break if you change the target. Polymorphic on target: a path-like string ('src/foo.ts') triggers file-mode; a name-like string ('validateUser') triggers symbol-mode. Use this BEFORE refactoring, renaming, or deleting code to know what depends on it.",
   {
@@ -364,7 +378,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_flow",
   "Trace the EXECUTION FLOW forward from an entry point — what does this code call into? With NO args, returns a ranked list of auto-detected entry points (orphans with outgoing calls, conventional names like main(), framework routes, tests). With an entrypoint argument, returns the call tree.",
   {
@@ -378,7 +392,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_symbol",
   "360° view of a symbol: definition, kind, callers, callees, confidence levels. Use to understand a function or class before changing it.",
   {
@@ -391,7 +405,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_symbols",
   "List symbols in a file, or search by name across the project. Use to discover what exists before drilling into a single symbol with codebase_symbol.",
   {
@@ -407,7 +421,7 @@ server.tool(
 
 // ── Context artifact tools ───────────────────────────────────────────────
 
-server.tool(
+srv.tool(
   "codebase_context",
   "List all context artifacts defined in .socraticodecontextartifacts.json — database schemas, API specs, infra configs, architecture docs, etc. Shows each artifact's name, description, path, and index status. Use this to discover what project knowledge is available beyond source code.",
   {
@@ -421,7 +435,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_context_search",
   "Semantic search across context artifacts (database schemas, API specs, infra configs, etc.) defined in .socraticodecontextartifacts.json. Auto-indexes on first use and auto-detects stale artifacts. Use this to find relevant infrastructure or domain knowledge.",
   {
@@ -452,7 +466,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_context_index",
   "Index or re-index all context artifacts defined in .socraticodecontextartifacts.json. Chunks and embeds artifact content into the vector database for semantic search. Usually not needed — codebase_context_search auto-indexes on first use.",
   {
@@ -466,7 +480,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_context_remove",
   "Remove all indexed context artifacts for a project from the vector database. Blocked while indexing is in progress — use codebase_stop or wait for the operation to finish first.",
   {
@@ -479,7 +493,7 @@ server.tool(
 
 // ── Management tools ─────────────────────────────────────────────────────
 
-server.tool(
+srv.tool(
   "codebase_health",
   "Check the health of all infrastructure: Docker, Qdrant container, Ollama, and embedding model. Use this to diagnose setup issues.",
   {},
@@ -488,7 +502,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_list_projects",
   "List all projects that have been indexed (have collections in Qdrant).",
   {},
@@ -497,7 +511,7 @@ server.tool(
   }),
 );
 
-server.tool(
+srv.tool(
   "codebase_about",
   "Display information about SocratiCode — what it is, its tools and how to use it. Use this to get a quick overview of the MCP tools and their purpose.",
   {},
@@ -505,12 +519,117 @@ server.tool(
     content: [{ type: "text", text: await handleManageTool("codebase_about", args) }],
   }),
 );
+}
+
+registerAllTools(server);
+
+// ── HTTP server session management ───────────────────────────────────────
+
+interface McpSession {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+}
+
+const sessions = new Map<string, McpSession>();
+let httpServer: ReturnType<typeof createServer> | null = null;
+
+async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (url.pathname !== "/mcp") {
+      res.writeHead(404).end("Not found");
+      return;
+    }
+
+    const sessionId = typeof req.headers["mcp-session-id"] === "string"
+      ? req.headers["mcp-session-id"]
+      : undefined;
+
+    const session = sessionId ? sessions.get(sessionId) : undefined;
+
+    if (req.method === "POST") {
+      const buffers: Buffer[] = [];
+      for await (const chunk of req) buffers.push(chunk);
+      const body = JSON.parse(Buffer.concat(buffers).toString());
+
+      if (!session) {
+        const newServer = new McpServer(
+          { name: "socraticode", version: SOCRATICODE_VERSION },
+          { capabilities: { tools: {} } },
+        );
+        registerAllTools(newServer);
+
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            sessions.set(sid, { server: newServer, transport });
+            logger.info("MCP session initialized", { sessionId: sid });
+          },
+          onsessionclosed: (sid) => {
+            sessions.delete(sid);
+            logger.info("MCP session closed", { sessionId: sid });
+          },
+        });
+
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid) sessions.delete(sid);
+        };
+
+        await newServer.connect(transport);
+        await transport.handleRequest(req, res, body);
+        return;
+      }
+
+      await session.transport.handleRequest(req, res, body);
+    } else if (req.method === "GET") {
+      if (!session) {
+        res.writeHead(400).end("Session ID required for GET");
+        return;
+      }
+      await session.transport.handleRequest(req, res);
+    } else if (req.method === "DELETE") {
+      if (!session) {
+        res.writeHead(400).end("Session ID required for DELETE");
+        return;
+      }
+      await session.transport.handleRequest(req, res);
+    } else {
+      res.writeHead(405).end("Method not allowed");
+    }
+  } catch (err) {
+    logger.error("HTTP request handler error", { error: String(err) });
+    if (!res.headersSent) {
+      res.writeHead(500).end("Internal server error");
+    }
+  }
+}
+
+async function startHttpServer(port: number): Promise<void> {
+  const server = createServer(handleMcpRequest);
+  httpServer = server;
+
+  await new Promise<void>((resolve, reject) => {
+    server.listen(port, () => {
+      logger.info(`SocratiCode MCP server listening on http://localhost:${port}/mcp`);
+      resolve();
+    });
+    server.once("error", reject);
+  });
+}
 
 // ── Start server ─────────────────────────────────────────────────────────
 
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  if (SOCRATICODE_PORT) {
+    await startHttpServer(SOCRATICODE_PORT);
+  } else {
+    setMcpLogSender((params) => {
+      server.server.sendLoggingMessage(params).catch(() => {});
+    });
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
 
   // Auto-resume watchers and incremental updates for already-indexed projects
   // Fire-and-forget — runs in background, non-blocking, non-fatal
@@ -540,23 +659,29 @@ async function main() {
   const shutdown = async (signal: string) => {
     if (shuttingDown) return; // prevent double shutdown
     shuttingDown = true;
-    await gracefulShutdown(signal, () => server.close());
+    await gracefulShutdown(signal, async () => {
+      if (httpServer) {
+        const srv = httpServer;
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
+      }
+      // Close all active HTTP sessions
+      for (const [, sess] of sessions) {
+        try { await sess.transport.close(); } catch {}
+      }
+      await server.close();
+    });
     process.exit(0);
   };
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  // ── Stdin pipe-break detection ─────────────────────────────────────────
-  // When the MCP host (e.g. Cline/VS Code) closes its side of the stdio pipe,
-  // Node.js may emit 'end', 'error', or 'close' on stdin depending on how
-  // abruptly the pipe was severed. A clean close emits 'end'; an abrupt
-  // break (e.g. heavy I/O during indexing) may skip 'end' and only emit
-  // 'error' + 'close'. Listen for all three to catch every scenario.
-  // The shuttingDown guard in shutdown() prevents double-shutdown.
-  process.stdin.on("end", () => shutdown("stdin EOF"));
-  process.stdin.on("error", () => shutdown("stdin error"));
-  process.stdin.on("close", () => shutdown("stdin close"));
+  // ── Stdin pipe-break detection (stdio mode only) ──────────────────────
+  if (!SOCRATICODE_PORT) {
+    process.stdin.on("end", () => shutdown("stdin EOF"));
+    process.stdin.on("error", () => shutdown("stdin error"));
+    process.stdin.on("close", () => shutdown("stdin close"));
+  }
 }
 
 main().catch((err) => {

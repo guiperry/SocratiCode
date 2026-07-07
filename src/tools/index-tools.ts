@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
 import { collectionName, projectIdFromPath } from "../config.js";
+import { mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
 import { awaitGraphBuild, isGraphBuildInProgress } from "../services/code-graph.js";
 import type { InfraProgressCallback } from "../services/docker.js";
 import { ensureQdrantReady, isDockerAvailable } from "../services/docker.js";

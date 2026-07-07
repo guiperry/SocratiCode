@@ -27,14 +27,13 @@
  *   TEXTEMBEDDER_PORT=8089                    (port for subprocess)
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
-import fsp from "node:fs/promises";
+import { type ChildProcess, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import path from "node:path";
+import fsp from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
-import { getEmbeddingConfig } from "./embedding-config.js";
 import type { EmbeddingHealthStatus, EmbeddingProvider, EmbeddingReadinessResult } from "./embedding-types.js";
 import { logger } from "./logger.js";
 
@@ -57,12 +56,35 @@ const QUEUE_CRITICAL_DEPTH = 30;
 /** Per-embed-request timeout (ms) — includes all internal batches. */
 const EMBED_TIMEOUT_MS = 120_000;
 
+/** Timeout for lightweight /health and /embed single-call requests (ms). */
+const HEALTH_TIMEOUT_MS = 5_000;
+
 /** After N consecutive timeouts kill the binary and let the queue re-spawn. */
 const MAX_CONSECUTIVE_TIMEOUTS = 3;
 
 /** Temp dir where the decompressed binary lives. */
 const TMP_DIR = path.join(os.tmpdir(), "socraticode-textembedder");
 const TMP_BIN_PATH = path.join(TMP_DIR, "text-embedder");
+
+// ── Fetch helper ────────────────────────────────────────────────────────
+
+/**
+ * fetch() with an abort timeout. Without this, HTTP calls can hang
+ * indefinitely if the binary is unresponsive, blocking the embed queue.
+ */
+async function fetchWithTimeout(
+  url: string,
+  timeoutMs: number,
+  options: RequestInit = {},
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ── Binary path discovery ──────────────────────────────────────────────
 
@@ -201,103 +223,114 @@ async function startBinary(port: number): Promise<string> {
   // Fast path: already know the URL
   if (subprocessUrl) return subprocessUrl;
 
-  // Probe the port first — another process may already be running
-  const existing = await probePort(port);
-  if (existing) return existing;
-
-  // Another caller is already starting the binary
+  // Another caller is already starting the binary — wait for it instead of
+  // spawning a second instance.
   if (binaryStarting) {
-    return new Promise((resolve, reject) => {
-      const interval = setInterval(() => {
-        if (subprocessUrl) {
-          clearInterval(interval);
-          resolve(subprocessUrl);
-        }
-        if (!subprocess && !binaryStarting) {
-          clearInterval(interval);
-          reject(new Error("Binary failed to start"));
-        }
-      }, HEALTH_POLL_MS);
-    });
+    return waitForBinaryStart();
   }
 
+  // Claim the start lock synchronously, BEFORE any await, so that concurrent
+  // callers cannot both slip past this guard and spawn duplicate subprocesses.
   binaryStarting = true;
-  const source = await resolveBinarySource();
 
-  if (!source) {
-    binaryStarting = false;
-    const pfx = platformGzName();
-    throw new Error(
-      `text-embedder binary not found for platform "${process.platform}". ` +
-      `Run 'make deploy-all' from the text-embedder directory to generate ` +
-      (pfx ? `${pfx} (expected name), ` : "") +
-      "or set TEXTEMBEDDER_BIN_PATH / TEXTEMBEDDER_URL.",
-    );
-  }
+  try {
+    // Probe the port first — another process may already be running
+    const existing = await probePort(port);
+    if (existing) return existing;
 
-  // Re-check port after resolving source — instance may have started while we looked
-  const recheck = await probePort(port);
-  if (recheck) {
-    binaryStarting = false;
-    return recheck;
-  }
+    const source = await resolveBinarySource();
 
-  // Decompress if necessary, or use bare binary directly
-  const binPath = source.isCompressed
-    ? await ensureBinaryExtracted(source.sourcePath)
-    : source.sourcePath;
-
-  const url = `http://localhost:${port}`;
-  logger.info("Starting text-embedder binary", { binPath, port });
-
-  subprocess = spawn(binPath, [`--addr=:${port}`], {
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-  });
-
-  subprocess.on("error", (err) => {
-    logger.error("text-embedder binary failed to start", { error: err.message });
-    subprocess = null;
-    binaryStarting = false;
-  });
-
-  subprocess.on("exit", (code, signal) => {
-    logger.info("text-embedder binary exited", { code, signal });
-    subprocess = null;
-    subprocessUrl = null;
-    binaryStarting = false;
-  });
-
-  const logStream = (data: Buffer) => {
-    for (const line of data.toString().split("\n").filter(Boolean)) {
-      logger.debug(`[text-embedder] ${line}`);
+    if (!source) {
+      throw new Error(
+        `text-embedder binary not found for platform "${process.platform}". ` +
+        `Run 'make deploy-all' from the text-embedder directory to generate ` +
+        (platformGzName() ? `${platformGzName()} (expected name), ` : "") +
+        "or set TEXTEMBEDDER_BIN_PATH / TEXTEMBEDDER_URL.",
+      );
     }
-  };
-  subprocess.stdout?.on("data", logStream);
-  subprocess.stderr?.on("data", logStream);
 
-  const deadline = Date.now() + BINARY_START_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    try {
-      const resp = await fetch(`${url}/health`);
-      if (resp.ok) {
-        logger.info("text-embedder binary is ready", { url });
-        subprocessUrl = url;
-        binaryStarting = false;
-        return url;
+    // Re-check port after resolving source — instance may have started while we looked
+    const recheck = await probePort(port);
+    if (recheck) return recheck;
+
+    // Decompress if necessary, or use bare binary directly
+    const binPath = source.isCompressed
+      ? await ensureBinaryExtracted(source.sourcePath)
+      : source.sourcePath;
+
+    const url = `http://localhost:${port}`;
+    logger.info("Starting text-embedder binary", { binPath, port });
+
+    subprocess = spawn(binPath, [`--addr=:${port}`], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: false,
+    });
+
+    subprocess.on("error", (err) => {
+      logger.error("text-embedder binary failed to start", { error: err.message });
+      subprocess = null;
+      binaryStarting = false;
+    });
+
+    subprocess.on("exit", (code, signal) => {
+      logger.info("text-embedder binary exited", { code, signal });
+      subprocess = null;
+      subprocessUrl = null;
+      binaryStarting = false;
+    });
+
+    const logStream = (data: Buffer) => {
+      for (const line of data.toString().split("\n").filter(Boolean)) {
+        logger.debug(`[text-embedder] ${line}`);
       }
-    } catch {
-      // Not ready yet
-    }
-    await new Promise((r) => setTimeout(r, HEALTH_POLL_MS));
-  }
+    };
+    subprocess.stdout?.on("data", logStream);
+    subprocess.stderr?.on("data", logStream);
 
-  killBinary();
-  binaryStarting = false;
-  throw new Error(
-    `text-embedder binary did not become ready within ${BINARY_START_TIMEOUT_MS / 1000}s. ` +
-    "Check the binary is compatible with your system.",
-  );
+    const deadline = Date.now() + BINARY_START_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      try {
+        const resp = await fetchWithTimeout(`${url}/health`, HEALTH_TIMEOUT_MS);
+        if (resp.ok) {
+          logger.info("text-embedder binary is ready", { url });
+          subprocessUrl = url;
+          return url;
+        }
+      } catch {
+        // Not ready yet
+      }
+      await new Promise((r) => setTimeout(r, HEALTH_POLL_MS));
+    }
+
+    killBinary();
+    throw new Error(
+      `text-embedder binary did not become ready within ${BINARY_START_TIMEOUT_MS / 1000}s. ` +
+      "Check the binary is compatible with your system.",
+    );
+  } finally {
+    // Always release the start lock. On success subprocessUrl is set and the
+    // fast path handles future calls; on failure waiters observe the cleared
+    // lock and reject.
+    binaryStarting = false;
+  }
+}
+
+/**
+ * Wait for an in-progress binary start to complete. Resolves with the URL once
+ * the starting caller sets subprocessUrl; rejects if the start fails.
+ */
+function waitForBinaryStart(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const interval = setInterval(() => {
+      if (subprocessUrl) {
+        clearInterval(interval);
+        resolve(subprocessUrl);
+      } else if (!subprocess && !binaryStarting) {
+        clearInterval(interval);
+        reject(new Error("Binary failed to start"));
+      }
+    }, HEALTH_POLL_MS);
+  });
 }
 
 function killBinary(): void {
@@ -328,8 +361,18 @@ function registerCleanup(): void {
     fsp.rm(TMP_DIR, { force: true, recursive: true }).catch(() => {});
   };
   process.on("exit", cleanup);
-  process.on("SIGINT", () => { cleanup(); process.exit(0); });
-  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+  // Cooperative shutdown: run our cleanup, but do NOT force an immediate exit
+  // when the host (e.g. the MCP server) has registered its own signal handler.
+  // Forcing process.exit(0) here would preempt the host's graceful shutdown.
+  // We only exit ourselves when we are the sole listener for the signal.
+  const onSignal = (sig: NodeJS.Signals) => {
+    cleanup();
+    if (process.listenerCount(sig) <= 1) {
+      process.exit(0);
+    }
+  };
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
 }
 
 // ── Embed request queue ──────────────────────────────────────────────
@@ -379,13 +422,6 @@ function startQueueMonitor(): void {
   }, QUEUE_MONITOR_INTERVAL_MS);
 }
 
-function stopQueueMonitor(): void {
-  if (queueMonitorTimer) {
-    clearInterval(queueMonitorTimer);
-    queueMonitorTimer = null;
-  }
-}
-
 /**
  * Process the embed queue — one request at a time. Each request may span
  * multiple internal HTTP batches (of TEXTEMBEDDER_BATCH_SIZE).
@@ -395,7 +431,10 @@ async function processQueue(): Promise<void> {
   queueWorkerRunning = true;
 
   while (embedQueue.length > 0) {
-    const req = embedQueue.shift()!;
+    const req = embedQueue.shift();
+    if (!req) {
+      break;
+    }
     try {
       const startTime = Date.now();
       const results = await doEmbed(req.texts);
@@ -470,7 +509,39 @@ async function doEmbed(texts: string[]): Promise<number[][]> {
       }
 
       const data: BatchResponse = await response.json() as BatchResponse;
-      results.push(...data.results.map((r) => unscaleVector(r.embedding)));
+
+      if (!data || !Array.isArray(data.results)) {
+        throw new Error(
+          "text-embedder /embed/batch returned an invalid response (missing results array)",
+        );
+      }
+
+      if (data.results.length !== batch.length) {
+        throw new Error(
+          `text-embedder /embed/batch returned ${data.results.length} vectors ` +
+          `for ${batch.length} texts — vector/input misalignment`,
+        );
+      }
+
+      // Realign by the server-provided index. This defends against a server
+      // that reorders results, which would otherwise silently misalign every
+      // vector with the wrong input text.
+      const ordered = new Array<number[]>(batch.length);
+      for (const r of data.results) {
+        if (typeof r.index !== "number" || r.index < 0 || r.index >= batch.length) {
+          throw new Error(
+            `text-embedder /embed/batch returned out-of-range index ${r.index}`,
+          );
+        }
+        if (ordered[r.index] !== undefined) {
+          throw new Error(
+            `text-embedder /embed/batch returned duplicate index ${r.index}`,
+          );
+        }
+        ordered[r.index] = unscaleVector(r.embedding);
+      }
+
+      results.push(...ordered);
     } finally {
       clearTimeout(timer);
     }
@@ -532,7 +603,7 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
     const baseUrl = await resolveBaseUrl();
 
     try {
-      const resp = await fetch(`${baseUrl}/health`);
+      const resp = await fetchWithTimeout(`${baseUrl}/health`, HEALTH_TIMEOUT_MS);
       if (!resp.ok) {
         throw new Error(`Health check returned status ${resp.status}`);
       }
@@ -584,7 +655,7 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
   async embedSingle(text: string): Promise<number[]> {
     const baseUrl = await resolveBaseUrl();
 
-    const response = await fetch(`${baseUrl}/embed`, {
+    const response = await fetchWithTimeout(`${baseUrl}/embed`, HEALTH_TIMEOUT_MS, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
@@ -611,22 +682,23 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
       lines.push(`${icon(true)} text-embedder mode: external (${externalUrl})`);
     } else {
       const source = await resolveBinarySource();
-      const binaryOk = !!source;
-      lines.push(
-        `${icon(binaryOk)} text-embedder binary: ` +
-        (binaryOk
-          ? `Found at ${source!.sourcePath}${source!.isCompressed ? " (gzipped)" : ""}`
-          : `Not found — run 'make deploy-all' from text-embedder dir`),
-      );
-      if (!binaryOk) {
+      if (!source) {
+        lines.push(
+          `${icon(false)} text-embedder binary: ` +
+          "Not found — run 'make deploy-all' from text-embedder dir",
+        );
         return { available: false, modelReady: false, statusLines: lines };
       }
+      lines.push(
+        `${icon(true)} text-embedder binary: ` +
+        `Found at ${source.sourcePath}${source.isCompressed ? " (gzipped)" : ""}`,
+      );
       lines.push(`${icon(true)} text-embedder mode: binary (decompresses on first use)`);
     }
 
     try {
       const baseUrl = await resolveBaseUrl();
-      const resp = await fetch(`${baseUrl}/health`);
+      const resp = await fetchWithTimeout(`${baseUrl}/health`, HEALTH_TIMEOUT_MS);
       if (!resp.ok) {
         lines.push(`${icon(false)} text-embedder: Health check failed (status ${resp.status})`);
         return { available: false, modelReady: false, statusLines: lines };

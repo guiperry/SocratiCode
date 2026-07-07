@@ -38,3 +38,5 @@ coverage/
 # Personal instructions (Copilot)
 .github/copilot-instructions.md
 .github/instructions/
+mcp.json
+.mcp.json

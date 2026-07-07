@@ -290,7 +290,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     embeddingDimensions: _config.embeddingDimensions,
     embeddingContextLength: _config.embeddingContextLength || "auto",
     hasApiKey: !!(embeddingProvider === "textembedder"
-      ? true // binary / external URL; no key needed
+      ? false // binary / external URL; no API key needed
       : embeddingProvider === "ollama"
         ? _config.ollamaApiKey
         : embeddingProvider === "openai"
