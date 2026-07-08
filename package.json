@@ -60,12 +60,10 @@
     "LICENSE-COMMERCIAL",
     "README.md",
     "THIRD-PARTY-LICENSES",
-    "socraticode_logo_thumbnail.png",
-    "text-embedder-linux.gz",
-    "text-embedder-darwin.gz",
-    "text-embedder-win.gz"
+    "socraticode_logo_thumbnail.png"
   ],
   "dependencies": {
+    "g-text-embedder": "^0.1.0",
     "@ast-grep/lang-bash": "^0.0.8",
     "@ast-grep/lang-c": "^0.0.6",
     "@ast-grep/lang-cpp": "^0.0.6",

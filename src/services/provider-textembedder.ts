@@ -10,30 +10,31 @@
  * by FixedPointScale (10000).
  *
  * Two modes:
- *   1. Binary mode (default): the binary is distributed as text-embedder.gz.
- *      The provider decompresses it to a temp directory on first use and
- *      spawns it as a subprocess.
- *   2. External mode: user runs the binary themselves and sets TEXTEMBEDDER_URL
- *      pointing at the HTTP API (e.g. http://localhost:8089).
+ *   1. npm-package mode (default): the native binary is delivered by the
+ *      `g-text-embedder` npm package (Publisher: guiperry). The provider
+ *      downloads the platform-matched native binary via the package's
+ *      `embedder-install` command and launches the server through the
+ *      package's `embedder` launcher (`npx g-text-embedder --addr :<port>`),
+ *      which resolves and spawns the downloaded native binary. No bundling of
+ *      platform binaries in this repo is required.
+ *   2. External mode: you run the binary yourself (e.g. via
+ *      `npx g-text-embedder --addr :8089`) and set TEXTEMBEDDER_URL to point
+ *      at the running HTTP API.
  *
  * Embed requests are serialised through a FIFO queue with health monitoring
- * and timeout recovery to prevent blockage. Before spawning the binary the
+ * and timeout recovery to prevent blockage. Before spawning the server the
  * provider probes the target port — if an instance is already running it
  * uses that one instead.
  *
  * Optional env:
- *   TEXTEMBEDDER_URL=http://localhost:8089     (external mode — skip binary)
- *   TEXTEMBEDDER_BIN_PATH=<path-to-binary>     (uncompressed binary path)
- *   TEXTEMBEDDER_PORT=8089                    (port for subprocess)
+ *   TEXTEMBEDDER_URL=http://localhost:8089   (external mode — skip launch)
+ *   TEXTEMBEDDER_PORT=8089                   (port for the subprocess)
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
-import { constants } from "node:fs";
-import fsp from "node:fs/promises";
-import os from "node:os";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
 import type { EmbeddingHealthStatus, EmbeddingProvider, EmbeddingReadinessResult } from "./embedding-types.js";
 import { logger } from "./logger.js";
 
@@ -62,9 +63,8 @@ const HEALTH_TIMEOUT_MS = 5_000;
 /** After N consecutive timeouts kill the binary and let the queue re-spawn. */
 const MAX_CONSECUTIVE_TIMEOUTS = 3;
 
-/** Temp dir where the decompressed binary lives. */
-const TMP_DIR = path.join(os.tmpdir(), "socraticode-textembedder");
-const TMP_BIN_PATH = path.join(TMP_DIR, "text-embedder");
+/** npm package that delivers the native text-embedder binary. */
+const NPM_PACKAGE = "g-text-embedder";
 
 // ── Fetch helper ────────────────────────────────────────────────────────
 
@@ -86,115 +86,69 @@ async function fetchWithTimeout(
   }
 }
 
-// ── Binary path discovery ──────────────────────────────────────────────
+// ── npm-package binary resolution ──────────────────────────────────────
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PLATFORM_MAP: Record<string, string> = {
-  linux: "text-embedder-linux.gz",
-  darwin: "text-embedder-darwin.gz",
-  win32: "text-embedder-win.gz",
-};
-
-function platformGzName(): string | null {
-  return PLATFORM_MAP[process.platform] ?? null;
+/** Repo root (src/services -> repo root). */
+function repoRoot(): string {
+  return path.resolve(__dirname, "..", "..");
 }
 
 /**
- * Candidates for the gzipped binary, checked in order.
- * Platform-specific binaries take priority over the generic fallback name.
+ * Resolve the `embedder` launcher shipped by the g-text-embedder npm package.
+ * Prefers a locally installed dependency (node_modules/.bin/embedder); falls
+ * back to `npx -y g-text-embedder` so it works without a global install (npx
+ * fetches the package on first use).
  */
-function gzCandidates(): string[] {
-  const candidates: string[] = [];
+function resolveEmbedderBin(): { command: string; args: string[] } {
+  const localBin = path.join(repoRoot(), "node_modules", ".bin", "embedder");
+  if (fs.existsSync(localBin)) {
+    return { command: localBin, args: [] };
+  }
+  const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+  return { command: npx, args: ["-y", NPM_PACKAGE] };
+}
 
-  const envBin = process.env.TEXTEMBEDDER_BIN_PATH;
-  if (envBin) candidates.push(envBin);
+/**
+ * Resolve the `embedder-install` command from the g-text-embedder npm package,
+ * used to download the native binary matching the current OS/arch. Mirrors
+ * resolveEmbedderBin(): prefer a local install, fall back to npx.
+ */
+function resolveInstallerBin(): { command: string; args: string[] } {
+  const localBin = path.join(repoRoot(), "node_modules", ".bin", "embedder-install");
+  if (fs.existsSync(localBin)) {
+    return { command: localBin, args: [] };
+  }
+  const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+  return { command: npx, args: ["-y", NPM_PACKAGE, "embedder-install"] };
+}
 
-  const pfx = platformGzName();
-  if (pfx) {
-    candidates.push(
-      path.resolve(process.cwd(), pfx),
-      path.resolve(__dirname, pfx),
-      path.resolve(__dirname, "..", pfx),
-      path.resolve(__dirname, "..", "..", pfx),
+/**
+ * Ensure the native text-embedder binary is downloaded by running the npm
+ * package's `embedder-install` command. The installer fetches the binary that
+ * matches the current platform into the package's install directory.
+ */
+function ensureNativeBinary(): void {
+  const installer = resolveInstallerBin();
+  const installArgs = installer.args.length > 0
+    ? [...installer.args, "embedder-install"]
+    : ["embedder-install"];
+  logger.info("Ensuring G-Text Embedder native binary is installed", {
+    command: [installer.command, ...installArgs].join(" "),
+  });
+  const result = spawnSync(installer.command, installArgs, {
+    stdio: "inherit",
+    env: process.env,
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      "Failed to install the G-Text Embedder native binary via the " +
+      `${NPM_PACKAGE} package. Try running '${installer.command} ${installArgs.join(" ")}' manually, ` +
+      "or set TEXTEMBEDDER_URL to point at an already-running instance.",
     );
   }
-
-  candidates.push(
-    path.resolve(process.cwd(), "text-embedder"),
-    path.resolve(process.cwd(), "text-embedder.gz"),
-    path.resolve(__dirname, "text-embedder.gz"),
-    path.resolve(__dirname, "..", "text-embedder.gz"),
-    path.resolve(__dirname, "..", "..", "text-embedder.gz"),
-  );
-
-  return candidates;
-}
-
-/**
- * Resolve the gzipped (or bare) binary path. Returns { gzPath, isCompressed }.
- * Returns null if nothing is found.
- */
-async function resolveBinarySource(): Promise<{ sourcePath: string; isCompressed: boolean } | null> {
-  for (const candidate of gzCandidates()) {
-    try {
-      await fsp.access(candidate, constants.R_OK);
-      const isCompressed = candidate.endsWith(".gz");
-      return { sourcePath: candidate, isCompressed };
-    } catch {
-      // not here
-    }
-  }
-  return null;
-}
-
-// ── Decompression ──────────────────────────────────────────────────────
-
-/** Path to an already-decompressed cached binary. */
-let extractedBinPath: string | null = null;
-
-/**
- * Ensure the decompressed binary exists in the temp dir, extracting it from
- * the gzipped package asset if needed. Returns the path to the binary.
- */
-async function ensureBinaryExtracted(sourcePath: string): Promise<string> {
-  // Fast path: already decompressed and file still exists (and is executable)
-  if (extractedBinPath) {
-    try {
-      await fsp.access(extractedBinPath, constants.X_OK);
-      return extractedBinPath;
-    } catch {
-      extractedBinPath = null;
-    }
-  }
-
-  // Before overwriting, check if the temp binary already exists and is executable.
-  // If it does, use it as-is to avoid ETXTBSY (text file busy) when the binary is
-  // currently running as a subprocess.
-  try {
-    await fsp.access(TMP_BIN_PATH, constants.X_OK);
-    logger.info("Using existing decompressed binary (avoiding overwrite)", { path: TMP_BIN_PATH });
-    extractedBinPath = TMP_BIN_PATH;
-    return extractedBinPath;
-  } catch {
-    // Not present — proceed with decompression
-  }
-
-  logger.info("Decompressing text-embedder binary", { source: sourcePath });
-
-  // Read gzipped data and decompress
-  const compressed = await fsp.readFile(sourcePath);
-  const decompressed = gunzipSync(compressed);
-
-  // Ensure temp dir exists
-  await fsp.mkdir(TMP_DIR, { recursive: true });
-
-  // Write with executable permissions
-  await fsp.writeFile(TMP_BIN_PATH, decompressed, { mode: 0o755 });
-
-  extractedBinPath = TMP_BIN_PATH;
-  return extractedBinPath;
 }
 
 // ── Subprocess management ──────────────────────────────────────────────
@@ -238,42 +192,38 @@ async function startBinary(port: number): Promise<string> {
     const existing = await probePort(port);
     if (existing) return existing;
 
-    const source = await resolveBinarySource();
+    // Download the platform-matched native binary via the npm package.
+    ensureNativeBinary();
 
-    if (!source) {
-      throw new Error(
-        `text-embedder binary not found for platform "${process.platform}". ` +
-        `Run 'make deploy-all' from the text-embedder directory to generate ` +
-        (platformGzName() ? `${platformGzName()} (expected name), ` : "") +
-        "or set TEXTEMBEDDER_BIN_PATH / TEXTEMBEDDER_URL.",
-      );
-    }
-
-    // Re-check port after resolving source — instance may have started while we looked
+    // Re-check port after install — an instance may have started meanwhile.
     const recheck = await probePort(port);
     if (recheck) return recheck;
 
-    // Decompress if necessary, or use bare binary directly
-    const binPath = source.isCompressed
-      ? await ensureBinaryExtracted(source.sourcePath)
-      : source.sourcePath;
-
+    const launcher = resolveEmbedderBin();
     const url = `http://localhost:${port}`;
-    logger.info("Starting text-embedder binary", { binPath, port });
+    const launchArgs = [...launcher.args, `--addr=:${port}`];
+    logger.info("Starting G-Text Embedder via npm package", {
+      command: [launcher.command, ...launchArgs].join(" "),
+      port,
+    });
 
-    subprocess = spawn(binPath, [`--addr=:${port}`], {
+    // Spawn detached on POSIX so we can kill the entire process group: the
+    // launcher (`embedder`) spawns the native binary via spawnSync, so killing
+    // only the launcher would orphan the native binary. Killing the group
+    // (negative pid) terminates both.
+    subprocess = spawn(launcher.command, launchArgs, {
       stdio: ["ignore", "pipe", "pipe"],
-      detached: false,
+      detached: process.platform !== "win32",
     });
 
     subprocess.on("error", (err) => {
-      logger.error("text-embedder binary failed to start", { error: err.message });
+      logger.error("G-Text Embedder failed to start", { error: err.message });
       subprocess = null;
       binaryStarting = false;
     });
 
     subprocess.on("exit", (code, signal) => {
-      logger.info("text-embedder binary exited", { code, signal });
+      logger.info("G-Text Embedder exited", { code, signal });
       subprocess = null;
       subprocessUrl = null;
       binaryStarting = false;
@@ -292,7 +242,7 @@ async function startBinary(port: number): Promise<string> {
       try {
         const resp = await fetchWithTimeout(`${url}/health`, HEALTH_TIMEOUT_MS);
         if (resp.ok) {
-          logger.info("text-embedder binary is ready", { url });
+          logger.info("G-Text Embedder is ready", { url });
           subprocessUrl = url;
           return url;
         }
@@ -304,8 +254,8 @@ async function startBinary(port: number): Promise<string> {
 
     killBinary();
     throw new Error(
-      `text-embedder binary did not become ready within ${BINARY_START_TIMEOUT_MS / 1000}s. ` +
-      "Check the binary is compatible with your system.",
+      `G-Text Embedder did not become ready within ${BINARY_START_TIMEOUT_MS / 1000}s. ` +
+      "Check that the g-text-embedder npm package installed correctly for your platform.",
     );
   } finally {
     // Always release the start lock. On success subprocessUrl is set and the
@@ -335,11 +285,23 @@ function waitForBinaryStart(): Promise<string> {
 
 function killBinary(): void {
   if (subprocess) {
+    const pid = subprocess.pid;
+    const isWindows = process.platform === "win32";
     try {
-      subprocess.kill("SIGTERM");
+      if (!isWindows && pid) {
+        // Kill the whole process group (launcher + native binary).
+        process.kill(-pid, "SIGTERM");
+      } else {
+        subprocess.kill("SIGTERM");
+      }
       setTimeout(() => {
-        if (subprocess) {
-          try { subprocess.kill("SIGKILL"); } catch { /* ignore */ }
+        if (subprocess && pid) {
+          try {
+            if (!isWindows) process.kill(-pid, "SIGKILL");
+            else subprocess.kill("SIGKILL");
+          } catch {
+            // Already gone
+          }
         }
       }, 2000);
     } catch {
@@ -356,9 +318,6 @@ function registerCleanup(): void {
   cleanupRegistered = true;
   const cleanup = () => {
     killBinary();
-    // Best-effort cleanup of the temp binary
-    fsp.rm(TMP_BIN_PATH, { force: true }).catch(() => {});
-    fsp.rm(TMP_DIR, { force: true, recursive: true }).catch(() => {});
   };
   process.on("exit", cleanup);
   // Cooperative shutdown: run our cleanup, but do NOT force an immediate exit
@@ -616,8 +575,9 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(
         `text-embedder is not reachable at ${baseUrl}. ` +
-        "Make sure the binary is running or set TEXTEMBEDDER_URL to point at an external instance. " +
-        `Underlying error: ${message}`,
+        "Make sure the g-text-embedder npm package installed the binary (run " +
+        "'npx g-text-embedder embedder-install'), or set TEXTEMBEDDER_URL to " +
+        `point at an external instance. Underlying error: ${message}`,
       );
     }
 
@@ -681,19 +641,10 @@ export class TextEmbedderEmbeddingProvider implements EmbeddingProvider {
     if (externalUrl) {
       lines.push(`${icon(true)} text-embedder mode: external (${externalUrl})`);
     } else {
-      const source = await resolveBinarySource();
-      if (!source) {
-        lines.push(
-          `${icon(false)} text-embedder binary: ` +
-          "Not found — run 'make deploy-all' from text-embedder dir",
-        );
-        return { available: false, modelReady: false, statusLines: lines };
-      }
-      lines.push(
-        `${icon(true)} text-embedder binary: ` +
-        `Found at ${source.sourcePath}${source.isCompressed ? " (gzipped)" : ""}`,
-      );
-      lines.push(`${icon(true)} text-embedder mode: binary (decompresses on first use)`);
+      const launcher = resolveEmbedderBin();
+      lines.push(`${icon(true)} text-embedder mode: npm package (${NPM_PACKAGE})`);
+      lines.push(`${icon(true)} text-embedder launcher: ${launcher.command}`);
+      lines.push(`${icon(true)} text-embedder install: ${resolveInstallerBin().command}`);
     }
 
     try {
